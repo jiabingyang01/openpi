@@ -28,10 +28,10 @@ For example:
 
 ```bash
 # To load a custom checkpoint (located in the top-level openpi/ directory):
-export SERVER_ARGS="--env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir ./my_custom_checkpoint"
+export SERVER_ARGS="--env LIBERO policy:checkpoint --policy.config pi0_libero --policy.dir /mnt/data-1/data/yangjiabing/.cache/openpi/openpi-assets/pytorch_checkpoints/pi0_libero"
 
 # To run the libero_10 task suite:
-export CLIENT_ARGS="--args.task-suite-name libero_10"
+export CLIENT_ARGS="--args.task-suite-name libero_object --args.port 8001"
 ```
 
 ## Without Docker (not recommended)
@@ -48,17 +48,20 @@ uv pip install -e third_party/libero
 export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
 
 # Run the simulation
-python examples/libero/main.py
+source examples/libero/.venv/bin/activate
+export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
+python examples/libero/main.py --args.task-suite-name libero_spatial --args.port 8000
 
 # To run with glx for Mujoco instead (use this if you have egl errors):
-MUJOCO_GL=glx python examples/libero/main.py
+MUJOCO_GL=glx python examples/libero/main.py --args.task-suite-name libero_spatial --args.port 8000
 ```
 
 Terminal window 2:
 
 ```bash
 # Run the server
-uv run scripts/serve_policy.py --env LIBERO
+source .venv/bin/activate
+uv run scripts/serve_policy.py --env LIBERO --port 8000
 ```
 
 ## Results

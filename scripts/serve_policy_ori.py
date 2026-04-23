@@ -2,7 +2,6 @@ import dataclasses
 import enum
 import logging
 import socket
-import transformers
 
 import tyro
 
@@ -11,9 +10,6 @@ from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 
-# UAOR
-# from openpi.uaor import apply_uaor_pi0_pytorch, GemmaMLP
-# transformers.models.gemma.modeling_gemma.GemmaMLP = GemmaMLP
 
 class EnvMode(enum.Enum):
     """Supported environments."""
@@ -66,17 +62,16 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         dir="gs://openpi-assets/checkpoints/pi05_base",
     ),
     EnvMode.ALOHA_SIM: Checkpoint(
-        config="pi05_aloha_sim",
-        dir="gs://openpi-assets/checkpoints/pi05_aloha_sim",
+        config="pi0_aloha_sim",
+        dir="gs://openpi-assets/checkpoints/pi0_aloha_sim",
     ),
     EnvMode.DROID: Checkpoint(
         config="pi05_droid",
         dir="gs://openpi-assets/checkpoints/pi05_droid",
     ),
     EnvMode.LIBERO: Checkpoint(
-        config="pi0_libero",
-        # dir="gs://openpi-assets/checkpoints/pi0_libero",
-        dir="/mnt/pfs/users/xuyuan/yjb/.cache/openpi/openpi-assets/pytorch_checkpoints/pi0_libero"
+        config="pi05_libero",
+        dir="gs://openpi-assets/checkpoints/pi05_libero",
     ),
 }
 
@@ -108,14 +103,6 @@ def main(args: Args) -> None:
     # Record the policy's behavior.
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
-
-    # apply_uaor_pi0_pytorch(
-    # self=policy._model, 
-    # starting_layer=1,
-    # ending_layer=17, # Gemma 2B/9B 层数不同，请根据实际情况(model.config.num_hidden_layers)设定
-    # entropy_threshold=0.20, # Pi0 的 VLM 部分可能会比较确信，阈值可能需要调高
-    # retracing_ratio=0.05
-    # )
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)

@@ -1,4 +1,3 @@
-from ast import arg
 import collections
 import dataclasses
 import logging
@@ -14,9 +13,6 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
-import os
-import time
-from typing import Optional, Union
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -31,8 +27,6 @@ class Args:
     port: int = 8000
     resize_size: int = 224
     replan_steps: int = 5
-    local_log_dir: str = "./logs"        # Local directory for eval logs    
-    run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -48,38 +42,8 @@ class Args:
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
 
-    seed: int = 9  # Random Seed (for reproducibility)
+    seed: int = 7  # Random Seed (for reproducibility)
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-logger = logging.getLogger(__name__)    
-
-def setup_logging(cfg: Args):
-    """Set up logging to file and optionally to wandb."""
-    # Create run ID
-    DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
-    run_id = f"EVAL-{cfg.task_suite_name}-pi0_uaor_last_0.20_0.05_9-{DATE_TIME}"
-    if cfg.run_id_note is not None:
-        run_id += f"--{cfg.run_id_note}"
-
-    # Set up local logging
-    os.makedirs(cfg.local_log_dir, exist_ok=True)
-    local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
-    log_file = open(local_log_filepath, "w")
-    logger.info(f"Logging to local log file: {local_log_filepath}")
-
-    return log_file, local_log_filepath, run_id, DATE_TIME
-
-def log_message(message: str, log_file=None):
-    """Log a message to console and optionally to a log file."""
-    logger.info(message)
-    if log_file:
-        log_file.write(message + "\n")
-        log_file.flush()
 
 def eval_libero(args: Args) -> None:
     # Set random seed
@@ -90,11 +54,8 @@ def eval_libero(args: Args) -> None:
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
-    # Setup logging
-    log_file, local_log_filepath, run_id, DATE_TIME  = setup_logging(args)
-    log_message(f"Task suite: {args.task_suite_name}", log_file)
-    video_out_path = args.video_out_path + f"/{args.task_suite_name}/{run_id}/"
-    pathlib.Path(video_out_path).mkdir(parents=True, exist_ok=True)
+
+    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -126,8 +87,7 @@ def eval_libero(args: Args) -> None:
         # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
-            # logging.info(f"\nTask: {task_description}")
-            log_message(f"\nTask: {task_description}", log_file)
+            logging.info(f"\nTask: {task_description}")
 
             # Reset environment
             env.reset()
@@ -140,8 +100,7 @@ def eval_libero(args: Args) -> None:
             t = 0
             replay_images = []
 
-            # logging.info(f"Starting episode {task_episodes+1}...")
-            log_message(f"Starting episode {task_episodes + 1}...", log_file)
+            logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -199,8 +158,7 @@ def eval_libero(args: Args) -> None:
                     t += 1
 
                 except Exception as e:
-                    # logging.error(f"Caught exception: {e}")
-                    log_message(f"Episode error: {e}", log_file)                    
+                    logging.error(f"Caught exception: {e}")
                     break
 
             task_episodes += 1
@@ -210,29 +168,23 @@ def eval_libero(args: Args) -> None:
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             imageio.mimwrite(
-                pathlib.Path(video_out_path) / f"rollout_episode_{total_episodes}_{task_segment}_{suffix}.mp4",
+                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
 
             # Log current results
-            # logging.info(f"Success: {done}")
-            # logging.info(f"# episodes completed so far: {total_episodes}")
-            # logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
-            log_message(f"Success: {done}", log_file)
-            log_message(f"# episodes completed so far: {total_episodes}", log_file)
-            log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
+            logging.info(f"Success: {done}")
+            logging.info(f"# episodes completed so far: {total_episodes}")
+            logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
         # Log final results
-        # logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        # logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
-        log_message(f"Current task success rate: {float(task_successes) / float(task_episodes)}", log_file)
-        log_message(f"Current total success rate: {float(total_successes) / float(total_episodes)}", log_file)
+        logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+        logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
-    # logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
-    # logging.info(f"Total episodes: {total_episodes}")
-    log_message(f"Total success rate: {float(total_successes) / float(total_episodes)}", log_file)
-    log_message(f"Total episodes: {total_episodes}", log_file)
+    logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    logging.info(f"Total episodes: {total_episodes}")
+
 
 def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
@@ -263,5 +215,5 @@ def _quat2axisangle(quat):
 
 
 if __name__ == "__main__":
-    # logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     tyro.cli(eval_libero)
