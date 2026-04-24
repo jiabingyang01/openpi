@@ -15,6 +15,7 @@ import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
+from openpi.models.vgaa import VGAAConfig
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -759,6 +760,66 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    #
+    # VGAA (Velocity-Grounded Attention Alignment) configs.
+    #
+    # These configs enable VGAA training on LIBERO. VGAA adds an auxiliary loss that aligns
+    # the action→observation attention with velocity Jacobian sensitivity. Inference is
+    # identical to baseline (zero overhead). Only training is modified.
+    TrainConfig(
+        name="pi0_libero_vgaa",
+        model=pi0_config.Pi0Config(
+            vgaa=VGAAConfig(
+                enabled=True,
+                lambda_align=0.1,
+                temperature=1.0,
+                num_probes=1,
+            ),
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_libero_vgaa_k3",
+        model=pi0_config.Pi0Config(
+            vgaa=VGAAConfig(
+                enabled=True,
+                lambda_align=0.1,
+                temperature=1.0,
+                num_probes=3,
+            ),
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_libero_vgaa_cheap",
+        model=pi0_config.Pi0Config(
+            vgaa=VGAAConfig(
+                enabled=True,
+                lambda_align=0.1,
+                temperature=1.0,
+                use_cheap_proxy=True,
+            ),
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
     ),
     #

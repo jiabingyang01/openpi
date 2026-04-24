@@ -161,7 +161,7 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, return_attn_weights=False):  # noqa: FBT002
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -225,8 +225,24 @@ class Attention(nn.Module):
         big_neg = -2.3819763e38  # See gemma/modules.py
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+        # Compute softmax once in float32, then cast for the main attention path.
+        probs_f32 = jax.nn.softmax(masked_logits, axis=-1)
 
+        # VGAA: optionally extract cross-attention summary (action queries -> obs keys).
+        # Only meaningful in training mode when both prefix (xs[0]) and suffix (xs[1]) are present.
+        if return_attn_weights and xs[0] is not None and len(xs) > 1 and xs[1] is not None:
+            prefix_len = xs[0].shape[1]
+            # probs_f32 shape: [B, K, G, T_total, S_total]
+            # Extract action-query -> obs-key submatrix and average over K, G, action queries
+            cross_attn = probs_f32[:, :, :, prefix_len:, :prefix_len]  # [B, K, G, T_suffix, T_prefix]
+            attn_summary = jnp.mean(cross_attn, axis=(1, 2, 3))  # [B, T_prefix]
+            # NOTE: No stop_gradient here. Gradients from the alignment loss must flow
+            # through attention weights back to Q/K projections. The sensitivity TARGET
+            # is stop-gradiented separately in vgaa.py.
+        else:
+            attn_summary = jnp.float32(0.0)
+
+        probs = probs_f32.astype(dtype)
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
@@ -246,7 +262,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, (k, v), attn_summary
 
 
 @at.typecheck
@@ -290,7 +306,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, return_attn_weights=False):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -305,7 +321,9 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache, attn_summary = attn(
+            pre_attn, positions, attn_mask, kv_cache, return_attn_weights=return_attn_weights
+        )
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -330,7 +348,7 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        return xs, (kv_cache, attn_summary)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -359,7 +377,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            static_argnums=(5, 6),  # 5=deterministic, 6=return_attn_weights
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -372,7 +390,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=return_attn_weights
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -396,19 +415,27 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_attn_weights: bool = False,
+    ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        embedded, (kv_cache, all_attn_weights) = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic, return_attn_weights
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
+        # When return_attn_weights=False, all_attn_weights is stacked scalars [L] (negligible).
+        # When True, it is [L, B, T_prefix] containing per-layer cross-attention summaries.
+        if not return_attn_weights:
+            all_attn_weights = None
+
         return [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ], kv_cache, all_attn_weights
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

@@ -11,6 +11,7 @@ from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
+from openpi.models.vgaa import VGAAConfig, compute_alignment_loss, compute_sensitivity_cheap, compute_sensitivity_hutchinson
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -98,6 +99,9 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        # VGAA configuration (disabled by default, no impact on baseline).
+        self.vgaa_config = config.vgaa
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -206,12 +210,57 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+
+        # VGAA is only active during training when enabled in config.
+        vgaa_active = self.vgaa_config.enabled and train
+
+        (prefix_out, suffix_out), _, all_attn_weights = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
+            return_attn_weights=vgaa_active,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if not vgaa_active:
+            return flow_loss
+
+        # --- VGAA: Velocity-Grounded Attention Alignment ---
+
+        # 1. Compute per-token sensitivity via Jacobian estimation.
+        # Define a pure function: prefix_tokens -> velocity prediction.
+        # All other inputs (suffix_tokens, masks, etc.) are closed over as constants.
+        def v_from_prefix(pt):
+            (_, suf), _, _ = self.PaliGemma.llm(
+                [pt, suffix_tokens],
+                mask=attn_mask,
+                positions=positions,
+                adarms_cond=[None, adarms_cond],
+            )
+            return self.action_out_proj(suf[:, -self.action_horizon :])
+
+        vgaa_rng = jax.random.fold_in(rng, 314159)
+        if self.vgaa_config.use_cheap_proxy:
+            sensitivity = compute_sensitivity_cheap(v_from_prefix, prefix_tokens)
+        else:
+            sensitivity = compute_sensitivity_hutchinson(
+                v_from_prefix, prefix_tokens, vgaa_rng, num_probes=self.vgaa_config.num_probes
+            )
+
+        # 2. Compute alignment loss: KL(sensitivity_dist || attention_dist).
+        align_loss = compute_alignment_loss(
+            all_attn_weights,
+            sensitivity,
+            temperature=self.vgaa_config.temperature,
+            layer_indices=self.vgaa_config.layer_indices,
+        )
+
+        # 3. Add alignment loss to flow matching loss.
+        # align_loss is a scalar; broadcasting to [B, H] so that
+        # jnp.mean(flow_loss + lambda * align_loss) = mean_flow + lambda * align.
+        return flow_loss + self.vgaa_config.lambda_align * align_loss
 
     @override
     def sample_actions(
@@ -234,7 +283,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        _, kv_cache, _ = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
             x_t, time = carry
@@ -258,7 +307,7 @@ class Pi0(_model.BaseModel):
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            (prefix_out, suffix_out), _, _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
                 positions=positions,
