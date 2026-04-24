@@ -230,15 +230,18 @@ class Attention(nn.Module):
 
         # VGAA: optionally extract cross-attention summary (action queries -> obs keys).
         # Only meaningful in training mode when both prefix (xs[0]) and suffix (xs[1]) are present.
-        if return_attn_weights and xs[0] is not None and len(xs) > 1 and xs[1] is not None:
+        # Note: xs[0]/xs[1] None-checks are static (Python-level), but return_attn_weights
+        # may be a traced value under nn.scan/remat, so we use jnp.where instead of Python if.
+        if xs[0] is not None and len(xs) > 1 and xs[1] is not None:
             prefix_len = xs[0].shape[1]
             # probs_f32 shape: [B, K, G, T_total, S_total]
             # Extract action-query -> obs-key submatrix and average over K, G, action queries
             cross_attn = probs_f32[:, :, :, prefix_len:, :prefix_len]  # [B, K, G, T_suffix, T_prefix]
-            attn_summary = jnp.mean(cross_attn, axis=(1, 2, 3))  # [B, T_prefix]
+            attn_summary_val = jnp.mean(cross_attn, axis=(1, 2, 3))  # [B, T_prefix]
             # NOTE: No stop_gradient here. Gradients from the alignment loss must flow
             # through attention weights back to Q/K projections. The sensitivity TARGET
             # is stop-gradiented separately in vgaa.py.
+            attn_summary = jnp.where(return_attn_weights, attn_summary_val, jnp.float32(0.0))
         else:
             attn_summary = jnp.float32(0.0)
 
