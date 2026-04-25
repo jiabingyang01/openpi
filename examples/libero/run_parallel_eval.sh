@@ -129,10 +129,10 @@ else
     echo "[launcher]        expected layout: \$POLICY_DIR/{assets,config.json,model.safetensors}" >&2
     exit 1
   fi
-  if [[ ! -f "$POLICY_DIR/model.safetensors" ]]; then
-    echo "[launcher] ERROR: model.safetensors missing under $POLICY_DIR" >&2
-    exit 1
-  fi
+  # if [[ ! -f "$POLICY_DIR/model.safetensors" ]]; then
+  #   echo "[launcher] ERROR: model.safetensors missing under $POLICY_DIR" >&2
+  #   exit 1
+  # fi
   echo "[launcher] MODEL=$MODEL POLICY_CONFIG=$POLICY_CONFIG POLICY_DIR=$POLICY_DIR"
   POLICY_ARGS="--env LIBERO policy:checkpoint --policy.config ${POLICY_CONFIG} --policy.dir ${POLICY_DIR}"
 fi
