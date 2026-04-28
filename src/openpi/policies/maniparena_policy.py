@@ -63,11 +63,23 @@ class ManipArenaInputs(transforms.DataTransformFn):
         state = np.asarray(data["state"], dtype=np.float32)
         state = state[:ACTION_DIM]
 
-        # Parse camera images.
+        # Parse camera images and resize to uniform 480x640.
+        TARGET_H, TARGET_W = 480, 640
         images = data.get("images", {})
-        front_img = _parse_image(images["front"]) if "front" in images else np.zeros((480, 640, 3), dtype=np.uint8)
-        left_img = _parse_image(images["left_wrist"]) if "left_wrist" in images else np.zeros_like(front_img)
-        right_img = _parse_image(images["right_wrist"]) if "right_wrist" in images else np.zeros_like(front_img)
+
+        def _get_img(key):
+            raw = images.get(key)
+            if raw is None:
+                return np.zeros((TARGET_H, TARGET_W, 3), dtype=np.uint8)
+            img = _parse_image(raw)
+            if img.shape[0] != TARGET_H or img.shape[1] != TARGET_W:
+                import cv2
+                img = cv2.resize(img, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
+            return img
+
+        front_img = _get_img("front")
+        left_img = _get_img("left_wrist")
+        right_img = _get_img("right_wrist")
 
         inputs = {
             "state": state,
