@@ -138,10 +138,33 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     local_root = data_config.local_root
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=local_root)
+
+    # Support multiple local roots for multi-task training.
+    if isinstance(local_root, (list, tuple)) and len(local_root) > 1:
+        datasets = []
+        all_tasks = {}
+        for root in local_root:
+            meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
+            ds = lerobot_dataset.LeRobotDataset(
+                repo_id,
+                root=root,
+                delta_timestamps={
+                    key: [t / meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+                },
+            )
+            if data_config.prompt_from_task:
+                ds = TransformedDataset(ds, [_transforms.PromptFromLeRobotTask(meta.tasks)])
+            datasets.append(ds)
+            all_tasks.update(meta.tasks)
+        logging.info(f"Multi-task training: {len(datasets)} datasets, {sum(len(d) for d in datasets)} total frames")
+        return torch.utils.data.ConcatDataset(datasets)
+
+    # Single root or None (download from Hub).
+    root = local_root[0] if isinstance(local_root, (list, tuple)) else local_root
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        root=local_root,
+        root=root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },

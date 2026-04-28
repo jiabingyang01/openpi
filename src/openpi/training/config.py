@@ -93,7 +93,8 @@ class DataConfig:
     prompt_from_task: bool = False
 
     # Local root directory for LeRobot dataset. If set, loads from local path instead of HuggingFace Hub.
-    local_root: str | None = None
+    # Can be a single path (str) or a list of paths for multi-task training.
+    local_root: str | Sequence[str] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -975,6 +976,55 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=5_000,
+    ),
+    # --- pi0.5 on ALL 20 real tasks (one-model) ---
+    TrainConfig(
+        name="pi05_maniparena_real_all",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotManipArenaDataConfig(
+            repo_id="ManipArena/maniparena-dataset",
+            assets=AssetsConfig(asset_id="maniparena/real_all_pi05"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root=[
+                    # Execution Reasoning (10 tasks)
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/arrange_cup_inverted_triangle",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/insert_wireline",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/pick_items_into_basket",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/pour_water_from_bottle",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_blocks_to_color",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_glasses_on_woodshelf",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_items_into_drawer",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_ring_onto_rod",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_spoon_to_bowl",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_stationery_in_case",
+                    # Semantic Reasoning (5 tasks)
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/classify_items_as_shape",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/pair_up_items",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/pick_fruits_into_basket",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/press_button_in_order",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/sort_headphone",
+                    # Mobile Manipulation (5 tasks)
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/mobile_manipulation/hang_up_picture",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/mobile_manipulation/organize_shoes",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/mobile_manipulation/put_bottle_on_woodshelf",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/mobile_manipulation/put_clothes_in_hamper",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/mobile_manipulation/take_and_set_tableware",
+                ],
+            ),
+            use_delta_actions=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
     ),
     #
     # Fine-tuning Aloha configs.
