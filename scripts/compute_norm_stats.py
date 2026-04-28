@@ -86,9 +86,66 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
+def _fast_parquet_norm_stats(local_roots, action_dim=14, max_frames=None):
+    """Compute norm stats directly from parquet files, skipping video decoding."""
+    import pandas as pd
+    import pathlib
+
+    if isinstance(local_roots, str):
+        local_roots = [local_roots]
+
+    all_states = []
+    all_actions = []
+    total = 0
+
+    for root in local_roots:
+        root = pathlib.Path(root)
+        parquets = sorted(root.glob("data/chunk-*/episode_*.parquet"))
+        for pf in parquets:
+            df = pd.read_parquet(pf, columns=["observation.state", "action"])
+            states = np.stack(df["observation.state"].tolist())[:, :action_dim]
+            actions = np.stack(df["action"].tolist())[:, :action_dim]
+            all_states.append(states)
+            all_actions.append(actions)
+            total += len(states)
+            if max_frames and total >= max_frames:
+                break
+        if max_frames and total >= max_frames:
+            break
+
+    all_states = np.concatenate(all_states)[:max_frames] if max_frames else np.concatenate(all_states)
+    all_actions = np.concatenate(all_actions)[:max_frames] if max_frames else np.concatenate(all_actions)
+
+    stats = {
+        "state": _normalize.NormStats(
+            mean=all_states.mean(axis=0),
+            std=all_states.std(axis=0),
+            q01=np.percentile(all_states, 1, axis=0),
+            q99=np.percentile(all_states, 99, axis=0),
+        ),
+        "actions": _normalize.NormStats(
+            mean=all_actions.mean(axis=0),
+            std=all_actions.std(axis=0),
+            q01=np.percentile(all_actions, 1, axis=0),
+            q99=np.percentile(all_actions, 99, axis=0),
+        ),
+    }
+    print(f"Fast parquet stats: {total} frames from {len(local_roots)} roots")
+    return stats
+
+
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
+
+    # Fast path: if local_root is available, read parquets directly (no video decode).
+    local_root = data_config.local_root
+    if local_root is not None:
+        norm_stats = _fast_parquet_norm_stats(local_root, max_frames=max_frames)
+        output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
+        print(f"Writing stats to: {output_path}")
+        _normalize.save(output_path, norm_stats)
+        return
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
