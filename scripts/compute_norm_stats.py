@@ -117,13 +117,13 @@ def _fast_parquet_norm_stats(local_roots, action_dim=14, max_frames=None):
     all_actions = np.concatenate(all_actions)[:max_frames] if max_frames else np.concatenate(all_actions)
 
     stats = {
-        "state": _normalize.NormStats(
+        "state": normalize.NormStats(
             mean=all_states.mean(axis=0),
             std=all_states.std(axis=0),
             q01=np.percentile(all_states, 1, axis=0),
             q99=np.percentile(all_states, 99, axis=0),
         ),
-        "actions": _normalize.NormStats(
+        "actions": normalize.NormStats(
             mean=all_actions.mean(axis=0),
             std=all_actions.std(axis=0),
             q01=np.percentile(all_actions, 1, axis=0),
@@ -144,7 +144,7 @@ def main(config_name: str, max_frames: int | None = None):
         norm_stats = _fast_parquet_norm_stats(local_root, max_frames=max_frames)
         output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
         print(f"Writing stats to: {output_path}")
-        _normalize.save(output_path, norm_stats)
+        normalize.save(output_path, norm_stats)
         return
 
     if data_config.rlds_data_dir is not None:
