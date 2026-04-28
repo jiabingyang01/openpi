@@ -21,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.maniparena_policy as maniparena_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -90,6 +91,9 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Local root directory for LeRobot dataset. If set, loads from local path instead of HuggingFace Hub.
+    local_root: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -353,6 +357,65 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotManipArenaDataConfig(DataConfigFactory):
+    """Config for ManipArena bimanual dataset (LeRobot format).
+
+    ManipArena provides 56D (real) or 28D (sim) state/action vectors.
+    The first 14D are end-effector (7D left + 7D right). Actions are
+    absolute EE poses, so we apply delta conversion for position dims.
+    """
+
+    # Whether to convert absolute EE actions to deltas (recommended for pi0).
+    use_delta_actions: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack: map ManipArena LeRobot keys to our internal keys.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "front": "observation.images.faceImg",
+                            "left_wrist": "observation.images.leftImg",
+                            "right_wrist": "observation.images.rightImg",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Data transforms: ManipArena-specific input/output processing.
+        data_transforms = _transforms.Group(
+            inputs=[maniparena_policy.ManipArenaInputs(model_type=model_config.model_type)],
+            outputs=[maniparena_policy.ManipArenaOutputs()],
+        )
+
+        # ManipArena actions are absolute EE poses. Convert position dims to
+        # deltas (relative to current state). Grippers stay absolute.
+        # Mask: left_pos(6)=delta, left_grip(1)=abs, right_pos(6)=delta, right_grip(1)=abs
+        if self.use_delta_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
         )
 
 
@@ -821,6 +884,97 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
+    ),
+    #
+    # ManipArena configs.
+    #
+    # Fine-tune pi0 on ManipArena bimanual dataset (14D EE: 7D left + 7D right).
+    #
+    # --- Sim tasks (28D state, first 14D = EE) ---
+    TrainConfig(
+        name="pi0_maniparena_sim",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotManipArenaDataConfig(
+            repo_id="ManipArena/maniparena-dataset",
+            assets=AssetsConfig(asset_id="maniparena/sim_press_button"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset"
+                           "/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90"
+                           "/sim/press_button_in_order",
+            ),
+            use_delta_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=5_000,
+        batch_size=32,
+    ),
+    # --- Real tasks (56D state, first 14D = EE) ---
+    TrainConfig(
+        name="pi0_maniparena",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotManipArenaDataConfig(
+            repo_id="ManipArena/maniparena-dataset",
+            assets=AssetsConfig(asset_id="maniparena/real_arrange_cup"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset"
+                           "/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90"
+                           "/real/execution_reasoning/arrange_cup_inverted_triangle",
+            ),
+            use_delta_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    # LoRA low-memory variant.
+    TrainConfig(
+        name="pi0_maniparena_low_mem",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotManipArenaDataConfig(
+            repo_id="ManipArena/maniparena-dataset",
+            assets=AssetsConfig(asset_id="maniparena/real_arrange_cup"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset"
+                           "/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90"
+                           "/real/execution_reasoning/arrange_cup_inverted_triangle",
+            ),
+            use_delta_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # --- pi0.5 on ManipArena sim ---
+    TrainConfig(
+        name="pi05_maniparena_sim",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotManipArenaDataConfig(
+            repo_id="ManipArena/maniparena-dataset",
+            assets=AssetsConfig(asset_id="maniparena/sim_press_button_pi05"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset"
+                           "/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90"
+                           "/sim/press_button_in_order",
+            ),
+            use_delta_actions=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=5_000,
     ),
     #
     # Fine-tuning Aloha configs.
