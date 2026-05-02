@@ -22,6 +22,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.maniparena_policy as maniparena_policy
+import openpi.policies.dynaactvae_transforms as dynaactvae_transforms
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -418,6 +419,45 @@ class LeRobotManipArenaDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=("action",),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotManipArenaDynaActVAEDataConfig(LeRobotManipArenaDataConfig):
+    """ManipArena + DynaActVAE: encode raw actions into frozen VAE latents during training,
+    decode generated latents back to raw actions during inference (Paper Section 3.3)."""
+
+    vae_checkpoint: str = ""
+    vae_z_dim: int = 16
+    vae_hidden_dims: tuple = (256, 512, 512)
+    vae_num_res_blocks: int = 8
+    # chunk_size is inherited from base class (used for VAE init)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Get base config from parent
+        base = super().create(assets_dirs, model_config)
+
+        # Add frozen VAE encoder (training) and decoder (inference) to data transforms
+        vae_kwargs = dict(
+            checkpoint_path=self.vae_checkpoint,
+            action_dim=14,
+            chunk_size=base.action_sequence_keys and model_config.action_horizon or 10,
+            z_dim=self.vae_z_dim,
+            hidden_dims=self.vae_hidden_dims,
+            num_res_blocks=self.vae_num_res_blocks,
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                *base.data_transforms.inputs,
+                dynaactvae_transforms.DynaActVAEEncodeActions(**vae_kwargs),
+            ],
+            outputs=[
+                dynaactvae_transforms.DynaActVAEDecodeActions(**vae_kwargs),
+                *base.data_transforms.outputs,
+            ],
+        )
+
+        return dataclasses.replace(base, data_transforms=data_transforms)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1013,6 +1053,79 @@ _CONFIGS = [
                 ],
             ),
             use_delta_actions=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # --- pi0.5 on preliminary 5 tasks ---
+    TrainConfig(
+        name="pi05_maniparena_preliminary",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotManipArenaDataConfig(
+            repo_id="ManipArena/maniparena-dataset",
+            assets=AssetsConfig(asset_id="maniparena/preliminary_pi05"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root=[
+                    # Press buttons in order (Semantic)
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/press_button_in_order",
+                    # Place blocks into colors (Execution)
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_blocks_to_color",
+                    # Classify items as shape (Semantic)
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/classify_items_as_shape",
+                    # Place ring on rod (Execution)
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_ring_onto_rod",
+                    # Put spoon to bowl (Execution)
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_spoon_to_bowl",
+                ],
+            ),
+            use_delta_actions=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # --- pi0.5 + DynaActVAE on preliminary 5 tasks ---
+    # VLA trains in latent action space (z_dim=16, T'=3), frozen VAE decodes at inference.
+    # Requires: trained Action VAE checkpoint from action-traj-vae project.
+    TrainConfig(
+        name="pi05_dynaactvae_preliminary",
+        # action_dim=16 (z_dim), action_horizon=3 (T' after VAE temporal compression)
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=3, action_dim=16, discrete_state_input=False),
+        data=LeRobotManipArenaDynaActVAEDataConfig(
+            repo_id="ManipArena/maniparena-dataset",
+            assets=AssetsConfig(asset_id="maniparena/preliminary_dynaactvae"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root=[
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/press_button_in_order",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_blocks_to_color",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/classify_items_as_shape",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_ring_onto_rod",
+                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_spoon_to_bowl",
+                ],
+            ),
+            use_delta_actions=False,
+            # Set this to the trained Action VAE checkpoint path
+            vae_checkpoint="/DATA/disk1/yjb/projects/VLA/action-traj-vae/checkpoints/maniparena_vae_no_pred/best.pt",
+            vae_z_dim=16,
         ),
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(

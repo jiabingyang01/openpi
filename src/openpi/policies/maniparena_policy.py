@@ -59,16 +59,33 @@ class ManipArenaInputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
 
     def __call__(self, data: dict) -> dict:
-        # Extract 14D EE state from potentially larger state vector.
-        state = np.asarray(data["state"], dtype=np.float32)
+        # Extract 14D EE state. Support both training key ("state") and
+        # inference key ("observation.state") from my_policy.py convert_input.
+        if "state" in data:
+            state = np.asarray(data["state"], dtype=np.float32)
+        elif "observation.state" in data:
+            state = np.asarray(data["observation.state"], dtype=np.float32)
+        else:
+            state = np.zeros(ACTION_DIM, dtype=np.float32)
         state = state[:ACTION_DIM]
 
         # Parse camera images and resize to uniform 480x640.
         TARGET_H, TARGET_W = 480, 640
+
+        # Support both training keys ("images/front") and inference keys
+        # ("observation.images.faceImg") from my_policy.py convert_input.
         images = data.get("images", {})
+        _IMG_KEY_MAP = {
+            "front": "observation.images.faceImg",
+            "left_wrist": "observation.images.leftImg",
+            "right_wrist": "observation.images.rightImg",
+        }
 
         def _get_img(key):
+            # Try training key first, then inference key, then top-level key.
             raw = images.get(key)
+            if raw is None:
+                raw = data.get(_IMG_KEY_MAP.get(key, ""))
             if raw is None:
                 return np.zeros((TARGET_H, TARGET_W, 3), dtype=np.uint8)
             img = _parse_image(raw)
