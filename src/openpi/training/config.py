@@ -1124,7 +1124,7 @@ _CONFIGS = [
             ),
             use_delta_actions=False,
             # Set this to the trained Action VAE checkpoint path
-            vae_checkpoint="/DATA/disk1/yjb/projects/VLA/action-traj-vae/checkpoints/maniparena_vae_no_pred/best.pt",
+            vae_checkpoint="/DATA/disk1/yjb/projects/VLA/action-traj-vae/checkpoints/maniparena_vidact/best.pt",
             vae_z_dim=16,
         ),
         batch_size=256,
