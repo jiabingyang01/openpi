@@ -1112,8 +1112,8 @@ _CONFIGS = [
     # Requires: trained Action VAE checkpoint from action-traj-vae project.
     TrainConfig(
         name="pi05_dynaactvae_preliminary",
-        # action_dim=16 (z_dim), action_horizon=3 (T' after VAE temporal compression)
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=3, action_dim=16, discrete_state_input=False),
+        # action_horizon=3 (T' after VAE temporal compression), action_dim=32 (default, latent is padded to 32)
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=3, discrete_state_input=False),
         data=LeRobotManipArenaDynaActVAEDataConfig(
             repo_id="ManipArena/maniparena-dataset",
             assets=AssetsConfig(asset_id="maniparena/preliminary_dynaactvae"),
