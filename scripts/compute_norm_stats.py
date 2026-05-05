@@ -134,14 +134,90 @@ def _fast_parquet_norm_stats(local_roots, action_dim=14, max_frames=None):
     return stats
 
 
+def _fast_parquet_norm_stats_with_vae(local_roots, vae_encoder, max_frames=None):
+    """Compute norm stats in VAE latent space: read parquet → VAE encode → stats."""
+    import pandas as pd
+    import pathlib
+
+    if isinstance(local_roots, str):
+        local_roots = [local_roots]
+
+    all_states = []
+    all_latents = []
+    total = 0
+
+    for root in local_roots:
+        root = pathlib.Path(root)
+        parquets = sorted(root.glob("data/chunk-*/episode_*.parquet"))
+        for pf in parquets:
+            df = pd.read_parquet(pf, columns=["observation.state", "action"])
+            states = np.stack(df["observation.state"].tolist())[:, :14]
+            actions = np.stack(df["action"].tolist())[:, :14]
+            all_states.append(states)
+
+            # Encode each action through VAE (process per-frame, VAE expects chunks)
+            # Just store raw actions, we'll encode in batch below
+            all_latents.append(actions)
+            total += len(states)
+            if max_frames and total >= max_frames:
+                break
+        if max_frames and total >= max_frames:
+            break
+
+    all_states = np.concatenate(all_states)[:max_frames] if max_frames else np.concatenate(all_states)
+    raw_actions = np.concatenate(all_latents)[:max_frames] if max_frames else np.concatenate(all_latents)
+
+    # Encode actions through frozen VAE in batches
+    # The VAE encoder expects (action_horizon, 14) per sample, so we feed individual frames
+    # wrapped as the data transform would
+    print(f"Encoding {len(raw_actions)} action frames through frozen VAE...")
+    encoded = []
+    for i in range(len(raw_actions)):
+        sample = {"actions": raw_actions[i:i+1].astype(np.float32)}  # (1, 14)
+        result = vae_encoder(sample)
+        encoded.append(result["actions"])  # latent shape
+
+    all_actions_latent = np.concatenate(encoded, axis=0) if encoded[0].ndim > 1 else np.stack(encoded)
+
+    stats = {
+        "state": normalize.NormStats(
+            mean=all_states.mean(axis=0),
+            std=all_states.std(axis=0),
+            q01=np.percentile(all_states, 1, axis=0),
+            q99=np.percentile(all_states, 99, axis=0),
+        ),
+        "actions": normalize.NormStats(
+            mean=all_actions_latent.mean(axis=0),
+            std=all_actions_latent.std(axis=0),
+            q01=np.percentile(all_actions_latent, 1, axis=0),
+            q99=np.percentile(all_actions_latent, 99, axis=0),
+        ),
+    }
+    print(f"Fast parquet+VAE stats: {total} frames, latent shape={all_actions_latent.shape[1:]}")
+    return stats
+
+
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
     # Fast path: if local_root is available, read parquets directly (no video decode).
     local_root = data_config.local_root
-    if local_root is not None:
+    # Check if DynaActVAE encoder is in the data transforms — if so, need to encode actions.
+    vae_encoder = None
+    for t in data_config.data_transforms.inputs:
+        if hasattr(t, 'checkpoint_path') and hasattr(t, 'z_dim') and t.checkpoint_path:
+            vae_encoder = t
+            break
+    if local_root is not None and vae_encoder is None:
         norm_stats = _fast_parquet_norm_stats(local_root, max_frames=max_frames)
+        output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
+        print(f"Writing stats to: {output_path}")
+        normalize.save(output_path, norm_stats)
+        return
+    if local_root is not None and vae_encoder is not None:
+        # Fast path + VAE: read parquet, encode through frozen VAE, compute latent stats.
+        norm_stats = _fast_parquet_norm_stats_with_vae(local_root, vae_encoder, max_frames=max_frames)
         output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
         print(f"Writing stats to: {output_path}")
         normalize.save(output_path, norm_stats)

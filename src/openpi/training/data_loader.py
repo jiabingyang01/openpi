@@ -131,6 +131,9 @@ def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
+    # Allow DataConfig to override the action horizon for loading (e.g., DynaActVAE).
+    if data_config.action_load_horizon is not None:
+        action_horizon = data_config.action_load_horizon
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")

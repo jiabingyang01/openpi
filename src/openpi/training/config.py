@@ -97,6 +97,11 @@ class DataConfig:
     # Can be a single path (str) or a list of paths for multi-task training.
     local_root: str | Sequence[str] | None = None
 
+    # Override the action horizon used for loading data (number of action steps per sample).
+    # If None, uses model_config.action_horizon. Use this when the data transform changes
+    # the action sequence length (e.g., DynaActVAE encodes 10 steps → 3 latent steps).
+    action_load_horizon: int | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -441,7 +446,7 @@ class LeRobotManipArenaDynaActVAEDataConfig(LeRobotManipArenaDataConfig):
         vae_kwargs = dict(
             checkpoint_path=self.vae_checkpoint,
             action_dim=14,
-            chunk_size=base.action_sequence_keys and model_config.action_horizon or 10,
+            chunk_size=10,  # Original action chunk length (VAE input), NOT the latent T'
             z_dim=self.vae_z_dim,
             hidden_dims=self.vae_hidden_dims,
             num_res_blocks=self.vae_num_res_blocks,
@@ -1121,9 +1126,9 @@ _CONFIGS = [
                     "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_ring_onto_rod",
                     "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_spoon_to_bowl",
                 ],
+                action_load_horizon=10,  # VAE needs 10 raw action steps → encodes to 3 latent steps
             ),
             use_delta_actions=False,
-            # Set this to the trained Action VAE checkpoint path
             vae_checkpoint="/DATA/disk1/yjb/projects/VLA/action-traj-vae/checkpoints/maniparena_vidact/best.pt",
             vae_z_dim=16,
         ),
