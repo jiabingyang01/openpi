@@ -172,7 +172,7 @@ def _fast_parquet_norm_stats_with_vae(local_roots, vae_encoder, max_frames=None)
     # wrapped as the data transform would
     print(f"Encoding {len(raw_actions)} action frames through frozen VAE...")
     encoded = []
-    for i in range(len(raw_actions)):
+    for i in tqdm.tqdm(range(len(raw_actions)), desc="VAE encoding"):
         sample = {"actions": raw_actions[i:i+1].astype(np.float32)}  # (1, 14)
         result = vae_encoder(sample)
         encoded.append(result["actions"])  # latent shape
