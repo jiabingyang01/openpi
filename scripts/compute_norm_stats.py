@@ -103,9 +103,9 @@ def _fast_parquet_norm_stats(local_roots, action_dim=14, max_frames=None):
         root = pathlib.Path(root)
         parquets = sorted(root.glob("data/chunk-*/episode_*.parquet"))
         for pf in parquets:
-            table = pq.read_table(str(pf), columns=["observation.state", "action"])
-            states = np.stack(table.column("observation.state").to_pylist())[:, :action_dim]
-            actions = np.stack(table.column("action").to_pylist())[:, :action_dim]
+            df = pd.read_parquet(pf, columns=["observation.state", "action"])
+            states = np.stack(df["observation.state"].tolist())[:, :action_dim]
+            actions = np.stack(df["action"].tolist())[:, :action_dim]
             all_states.append(states)
             all_actions.append(actions)
             total += len(states)
@@ -151,9 +151,9 @@ def _fast_parquet_norm_stats_with_vae(local_roots, vae_encoder, max_frames=None)
         root = pathlib.Path(root)
         parquets = sorted(root.glob("data/chunk-*/episode_*.parquet"))
         for pf in parquets:
-            table = pq.read_table(str(pf), columns=["observation.state", "action"])
-            states = np.stack(table.column("observation.state").to_pylist())[:, :14]
-            actions = np.stack(table.column("action").to_pylist())[:, :14]
+            df = pd.read_parquet(pf, columns=["observation.state", "action"])
+            states = np.stack(df["observation.state"].tolist())[:, :14]
+            actions = np.stack(df["action"].tolist())[:, :14]
             all_states.append(states)
 
             # Encode each action through VAE (process per-frame, VAE expects chunks)
