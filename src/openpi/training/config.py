@@ -1081,16 +1081,11 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 local_root=[
-                    # Press buttons in order (Semantic)
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/press_button_in_order",
-                    # Place blocks into colors (Execution)
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_blocks_to_color",
-                    # Classify items as shape (Semantic)
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/classify_items_as_shape",
-                    # Place ring on rod (Execution)
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_ring_onto_rod",
-                    # Put spoon to bowl (Execution)
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_spoon_to_bowl",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/press_button_in_order",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/put_blocks_to_color",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/classify_items_as_shape",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/put_ring_onto_rod",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/put_spoon_to_bowl",
                 ],
             ),
             use_delta_actions=False,
@@ -1120,11 +1115,11 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 local_root=[
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/press_button_in_order",
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_blocks_to_color",
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/semantic_reasoning/classify_items_as_shape",
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_ring_onto_rod",
-                    "/DATA/disk1/yjb/.cache/huggingface/hub/datasets--ManipArena--maniparena-dataset/snapshots/076e818a76a29d3ac930f840ab8af981d7f71e90/real/execution_reasoning/put_spoon_to_bowl",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/press_button_in_order",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/put_blocks_to_color",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/classify_items_as_shape",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/put_ring_onto_rod",
+                    "/DATA/disk1/yjb/datasets/maniparena_converted/put_spoon_to_bowl",
                 ],
                 action_load_horizon=10,  # VAE needs 10 raw action steps → encodes to 3 latent steps
             ),
