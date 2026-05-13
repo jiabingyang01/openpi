@@ -20,6 +20,9 @@ import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+import datasets as _hf_datasets
+_hf_datasets.disable_progress_bars()
+
 import av
 import numpy as np
 import pyarrow as pa
@@ -90,8 +93,22 @@ def _convert_episode(args_tuple):
             for i, img_bytes in enumerate(image_data[img_key])
         ]
 
-    new_table = pa.table(columns)
-    pq.write_table(new_table, out_data_dir / f"episode_{ep:06d}.parquet")
+    # Use HF datasets to write parquet with proper Image feature metadata,
+    # so that load_dataset automatically decodes bytes to PIL Image.
+    import datasets
+    datasets.disable_progress_bars()
+    features = {}
+    for col_name in columns:
+        if col_name in image_keys:
+            features[col_name] = datasets.Image()
+        else:
+            # Let HF infer non-image column types
+            pass
+    hf_ds = datasets.Dataset.from_dict(columns)
+    # Cast image columns to Image type
+    for img_key in image_keys:
+        hf_ds = hf_ds.cast_column(img_key, datasets.Image())
+    hf_ds.to_parquet(str(out_data_dir / f"episode_{ep:06d}.parquet"))
     return n_frames
 
 
