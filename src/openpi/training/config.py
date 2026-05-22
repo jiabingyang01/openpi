@@ -16,6 +16,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 from openpi.models.vgaa import VGAAConfig
+from openpi.models_pytorch.apsg import APSGConfig, APSGProjection, libero_agentview_projector
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -364,6 +365,61 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoAPSGDataConfig(LeRobotLiberoDataConfig):
+    """LIBERO data config + APSG projection transform.
+
+    For ``apsg.target_mode='future_state_direct'`` (default), this factory adds
+    ``'state'`` to ``action_sequence_keys`` so the LeRobot dataset returns
+    state chunked to length ``action_horizon``. ``APSGProjection`` consumes
+    that chunk to compute the H-step future EE projection target and then
+    collapses state back to its standard shape for downstream transforms.
+    """
+
+    apsg: APSGConfig = dataclasses.field(default_factory=APSGConfig)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base = super().create(assets_dirs, model_config)
+        if not self.apsg.enabled:
+            return base
+        # Select suite-specific camera (object suite has its own placement).
+        # The factory cannot know per-sample which suite a sample is from, so we
+        # default to the spatial/goal/10 camera. If you train on a mix that
+        # includes the libero_object subset, swap this for a per-task lookup
+        # transform.
+        camera = libero_agentview_projector(suite="default")
+        projection_transform = APSGProjection(cfg=self.apsg, camera=camera)
+        # APSGProjection must run AFTER LiberoInputs (so 'state' key exists)
+        # but BEFORE DeltaActions modifies the action chunk. LiberoInputs is
+        # always inputs[0]; DeltaActions, if present, is inputs[1]. We insert
+        # at index 1.
+        new_inputs = list(base.data_transforms.inputs)
+        # Find LiberoInputs index; insert immediately after it.
+        insert_at = 1
+        for i, tr in enumerate(new_inputs):
+            if isinstance(tr, libero_policy.LiberoInputs):
+                insert_at = i + 1
+                break
+        new_inputs.insert(insert_at, projection_transform)
+        new_data_transforms = _transforms.Group(
+            inputs=new_inputs,
+            outputs=base.data_transforms.outputs,
+        )
+
+        # For future_state_direct we need state chunked alongside actions.
+        new_action_sequence_keys = base.action_sequence_keys
+        if self.apsg.target_mode == "future_state_direct":
+            extra = ("state",) if "state" not in base.action_sequence_keys else ()
+            new_action_sequence_keys = tuple(base.action_sequence_keys) + extra
+
+        return dataclasses.replace(
+            base,
+            data_transforms=new_data_transforms,
+            action_sequence_keys=new_action_sequence_keys,
         )
 
 
@@ -909,6 +965,41 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    #
+    # APSG (Action-Projected Self-Grounding) configs.
+    #
+    # Auxiliary loss aligning action-expert -> vision cross-attention to a
+    # Gaussian over the projected future EE position. PyTorch-only; inference
+    # is identical to baseline (zero overhead).
+    #
+    TrainConfig(
+        name="pi0_libero_apsg",
+        model=pi0_config.Pi0Config(
+            apsg=APSGConfig(
+                enabled=True,
+                lambda_attn=0.05,
+                layer_indices=(0, 17),
+                sigma_alpha_per_m=15.0,
+                sigma_min_patches=1.5,
+                target_mode="future_state_direct",
+                image_key="base_0_rgb",
+                warmup_steps=2000,
+            ),
+        ),
+        data=LeRobotLiberoAPSGDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            apsg=APSGConfig(
+                enabled=True,
+                target_mode="future_state_direct",
+                sigma_alpha_per_m=15.0,
+                sigma_min_patches=1.5,
+            ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,

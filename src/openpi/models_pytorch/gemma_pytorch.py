@@ -58,6 +58,13 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
+        # APSG attention-capture hooks. Default-off: when `_apsg_capture_layers`
+        # is empty the capture branch in `compute_layer_complete` is a no-op.
+        self._apsg_capture_layers: set[int] = set()
+        self._apsg_attn_cache: dict = {}
+        self._apsg_prefix_len: int | None = None
+        self._apsg_set_prefix_len = None  # optional callable: () -> int
+
         self.to_bfloat16_for_selected_params(precision)
 
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
@@ -197,8 +204,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
-                # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
+                # Attention computation. We always request the weights (cheap;
+                # they are computed internally anyway) so that APSG capture can
+                # be enabled with no graph surgery. When capture is off the
+                # returned weights are discarded immediately.
+                att_output, attn_weights_full = modeling_gemma.eager_attention_forward(
                     self.paligemma.language_model.layers[layer_idx].self_attn,
                     query_states,
                     key_states,
@@ -235,12 +245,24 @@ class PaliGemmaWithExpertModel(nn.Module):
                     outputs_embeds.append(out_emb)
                     start_pos = end_pos
 
-                return outputs_embeds
+                # APSG capture: returned alongside outputs_embeds so the slice
+                # survives gradient checkpointing. When capture is inactive for
+                # this layer we return None (zero-overhead).
+                attn_capture = None
+                if self._apsg_capture_layers and layer_idx in self._apsg_capture_layers:
+                    prefix_len = self._apsg_prefix_len
+                    if prefix_len is None and self._apsg_set_prefix_len is not None:
+                        prefix_len = int(self._apsg_set_prefix_len())
+                        self._apsg_prefix_len = prefix_len
+                    if prefix_len is not None:
+                        attn_capture = attn_weights_full[:, :, prefix_len:, :prefix_len].to(torch.float32)
+
+                return outputs_embeds, attn_capture
 
             # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):
                 if use_gradient_checkpointing:
-                    inputs_embeds = torch.utils.checkpoint.checkpoint(
+                    inputs_embeds, layer_attn_capture = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,
                         layer_idx,
                         inputs_embeds,
@@ -251,9 +273,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                         preserve_rng_state=False,
                     )
                 else:
-                    inputs_embeds = compute_layer_complete(
+                    inputs_embeds, layer_attn_capture = compute_layer_complete(
                         layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
                     )
+                if layer_attn_capture is not None:
+                    self._apsg_attn_cache[layer_idx] = layer_attn_capture
 
                 # Old code removed - now using compute_layer_complete function above
 

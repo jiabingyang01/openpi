@@ -406,7 +406,8 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    apsg_cfg = getattr(model_cfg, "apsg", None)
+    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg, apsg_config=apsg_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -525,15 +526,31 @@ def train_loop(config: _config.TrainConfig):
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            # Forward pass. Provide current step to the underlying model so the
+            # optional APSG lambda warmup can scale itself.
+            inner_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+            inner_model.apsg_step = global_step
 
-            loss = losses.mean()
+            losses = model(observation, actions)
+            # APSG returns a dict with the action loss tensor plus auxiliaries.
+            apsg_loss_val = None
+            apsg_lambda_val = 0.0
+            apsg_in_bounds = None
+            if isinstance(losses, dict):
+                action_losses = losses["action_loss"]
+                apsg_loss_val = losses["apsg_loss"]
+                apsg_lambda_val = float(losses["apsg_lambda"])
+                apsg_in_bounds = float(losses["apsg_in_bounds"].item())
+                action_loss = action_losses.mean()
+                loss = action_loss + apsg_lambda_val * apsg_loss_val
+            else:
+                # Baseline path: per-element tensor.
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                action_loss = losses.mean()
+                loss = action_loss
 
             # Backward pass
             loss.backward()
@@ -557,13 +574,17 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                info = {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                if apsg_loss_val is not None:
+                    info["action_loss"] = float(action_loss.item())
+                    info["apsg_loss"] = float(apsg_loss_val.item())
+                    info["apsg_lambda"] = apsg_lambda_val
+                    info["apsg_in_bounds"] = apsg_in_bounds
+                infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
@@ -595,6 +616,11 @@ def train_loop(config: _config.TrainConfig):
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    # APSG auxiliaries (only present when APSG is enabled).
+                    for k in ("action_loss", "apsg_loss", "apsg_lambda", "apsg_in_bounds"):
+                        vals = [info[k] for info in infos if k in info]
+                        if vals:
+                            log_payload[k] = sum(vals) / len(vals)
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()

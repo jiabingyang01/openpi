@@ -170,4 +170,7 @@ def preprocess_observation_pytorch(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        apsg_target_uv=getattr(observation, "apsg_target_uv", None),
+        apsg_target_in_bounds=getattr(observation, "apsg_target_in_bounds", None),
+        apsg_sigma_patches=getattr(observation, "apsg_sigma_patches", None),
     )

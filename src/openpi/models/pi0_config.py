@@ -9,6 +9,7 @@ from typing_extensions import override
 from openpi.models import model as _model
 import openpi.models.gemma as _gemma
 from openpi.models.vgaa import VGAAConfig
+from openpi.models_pytorch.apsg import APSGConfig
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
@@ -34,6 +35,9 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
     # VGAA configuration. When vgaa.enabled=False (default), the model behaves identically to baseline.
     vgaa: VGAAConfig = dataclasses.field(default_factory=VGAAConfig)
+    # APSG configuration (PyTorch path). When apsg.enabled=False (default), the
+    # model behaves identically to baseline. See openpi.models_pytorch.apsg.
+    apsg: APSGConfig = dataclasses.field(default_factory=APSGConfig)
 
     def __post_init__(self):
         if self.max_token_len is None:

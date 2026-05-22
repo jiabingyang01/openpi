@@ -7,6 +7,7 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+from openpi.models_pytorch import apsg as _apsg
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -82,10 +83,17 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class PI0Pytorch(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, apsg_config: _apsg.APSGConfig | None = None):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        # APSGConfig is decoupled from the dataset projector: the projection is
+        # pre-computed in the data pipeline (so we get raw, un-normalized state)
+        # and reaches the model via Observation.apsg_target_uv. Defaults to
+        # disabled, meaning the model is byte-identical to baseline.
+        self.apsg_config: _apsg.APSGConfig = apsg_config or _apsg.APSGConfig()
+        # Set externally by the training loop for optional lambda warm-up.
+        self.apsg_step: int = 0
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -313,8 +321,13 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+    def forward(self, observation, actions, noise=None, time=None):
+        """Do a full training forward pass and compute the loss.
+
+        Returns either a per-element tensor (baseline) or a dict
+        ``{"action_loss": [B, H, D], "apsg_loss": scalar, "apsg_lambda": float,
+        "apsg_in_bounds": float}`` when APSG is active.
+        """
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
@@ -345,6 +358,27 @@ class PI0Pytorch(nn.Module):
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
+        # APSG: arm attention capture before the joint forward when enabled
+        # and when the data pipeline supplied a projection target. Zero-overhead
+        # when either condition is false.
+        apsg_target_uv = getattr(observation, "apsg_target_uv", None)
+        apsg_target_in_bounds = getattr(observation, "apsg_target_in_bounds", None)
+        apsg_sigma_patches = getattr(observation, "apsg_sigma_patches", None)
+        apsg_active = bool(
+            self.apsg_config.enabled and self.training and apsg_target_uv is not None
+        )
+        prefix_len_val = int(prefix_pad_masks.shape[1])
+        target_dist = None
+        in_bounds = None
+        if apsg_active:
+            target_dist, in_bounds = self._build_apsg_target_dist(
+                apsg_target_uv, apsg_target_in_bounds, apsg_sigma_patches
+            )
+            self.paligemma_with_expert._apsg_capture_layers = set(int(i) for i in self.apsg_config.layer_indices)
+            self.paligemma_with_expert._apsg_attn_cache = {}
+            self.paligemma_with_expert._apsg_prefix_len = prefix_len_val
+            self.paligemma_with_expert._apsg_set_prefix_len = None
+
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
@@ -370,7 +404,100 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        action_loss = F.mse_loss(u_t, v_t, reduction="none")
+
+        if not apsg_active:
+            return action_loss
+
+        # Compute APSG loss from captured attention. The captured tensor covers
+        # the *full* suffix as queries; we keep only the action-token rows
+        # (last `action_horizon`) to focus the supervision on action queries.
+        attn_cache = self.paligemma_with_expert._apsg_attn_cache
+        n_act = self.config.action_horizon
+        # vision tokens for the supervised image. Currently APSG supervises the
+        # first image only (typically the third-person view). Image tokens come
+        # first in the prefix, in `images.keys()` order.
+        num_vis_per_image = self._infer_num_vis_tokens(images)
+        image_keys = list(observation.images.keys())
+        if self.apsg_config.image_key not in image_keys:
+            target_idx = 0
+        else:
+            target_idx = image_keys.index(self.apsg_config.image_key)
+        vis_lo = target_idx * num_vis_per_image
+        vis_hi = vis_lo + num_vis_per_image
+
+        attn_action_per_layer = {}
+        for layer_idx, attn in attn_cache.items():
+            # attn: [B, H, suffix_len, prefix_len]; keep action rows and target image cols.
+            attn_act = attn[:, :, -n_act:, vis_lo:vis_hi]
+            attn_action_per_layer[layer_idx] = attn_act
+
+        # Release capture references to avoid keeping graph fragments alive.
+        self.paligemma_with_expert._apsg_capture_layers = set()
+        self.paligemma_with_expert._apsg_attn_cache = {}
+        self.paligemma_with_expert._apsg_prefix_len = None
+
+        apsg_loss_value = _apsg.compute_apsg_loss(
+            attn_action_per_layer,
+            target_dist,
+            in_bounds,
+            self.apsg_config.layer_indices,
+            reduction=self.apsg_config.layer_reduction,
+        )
+        lam = _apsg.apsg_lambda(self.apsg_config, getattr(self, "apsg_step", None))
+
+        return {
+            "action_loss": action_loss,
+            "apsg_loss": apsg_loss_value,
+            "apsg_lambda": lam,
+            "apsg_in_bounds": in_bounds.float().mean(),
+        }
+
+    # ------------------------------------------------------------------
+    # APSG helpers
+    # ------------------------------------------------------------------
+
+    def _infer_num_vis_tokens(self, images_list) -> int:
+        """Number of vision tokens per image after SigLIP. SigLIP @ 224/14 -> 256."""
+        cfg = self.apsg_config
+        side = cfg.image_size // cfg.patch_size
+        return side * side
+
+    def _build_apsg_target_dist(
+        self,
+        apsg_target_uv: Tensor,
+        apsg_target_in_bounds: Tensor | None,
+        apsg_sigma_patches: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        """Build the APSG target Gaussian distribution over the patch grid.
+
+        ``apsg_target_uv`` is the data-pipeline-computed (u,v) in [0,1]^2 of
+        the projected future EE position. ``apsg_target_in_bounds`` is an
+        optional bool tensor of shape [B]; samples flagged out-of-bounds are
+        masked out of the loss. ``apsg_sigma_patches`` is an optional [B]
+        tensor giving the per-sample Gaussian width in patch units (typically
+        ``alpha * displacement_m + sigma_min``, computed in the data
+        transform). Falls back to a constant ``sigma_min`` when absent.
+        """
+        cfg = self.apsg_config
+        device = apsg_target_uv.device
+        uv = apsg_target_uv.to(torch.float32)
+        if apsg_target_in_bounds is None:
+            in_bounds = torch.ones(uv.shape[0], dtype=torch.bool, device=device)
+        else:
+            in_bounds = apsg_target_in_bounds.to(torch.bool)
+        if apsg_sigma_patches is None:
+            sigma_patches = torch.full(
+                (uv.shape[0],), cfg.sigma_min_patches,
+                device=device, dtype=torch.float32,
+            )
+        else:
+            sigma_patches = apsg_sigma_patches.to(torch.float32)
+        grid = cfg.image_size // cfg.patch_size
+        target_dist, in_bounds = _apsg.make_gaussian_target(
+            uv, sigma_patches, grid, grid, in_bounds
+        )
+        return target_dist, in_bounds
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
