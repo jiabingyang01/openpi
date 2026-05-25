@@ -72,7 +72,7 @@ SEED="${SEED:-9}"
 #   RUN_ID="pi0_base_ep30k"
 #   RUN_ID="pi05_ft_${TASK_SUITE}_v1"
 TS="$(date +%Y_%m_%d-%H_%M_%S)"
-RUN_ID="${RUN_ID:-${MODEL}-${TASK_SUITE}-${TS}}"
+RUN_ID="${RUN_ID:-${MODEL}-${TASK_SUITE}}-${TS}"
 
 # Where all logs/JSON go. Override LOG_DIR if you want a custom path.
 LOG_DIR="${LOG_DIR:-./logs/parallel_${RUN_ID}}"

@@ -8,6 +8,7 @@ import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch import apsg as _apsg
+from openpi.models_pytorch import igca as _igca
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -83,7 +84,7 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class PI0Pytorch(nn.Module):
-    def __init__(self, config, apsg_config: _apsg.APSGConfig | None = None):
+    def __init__(self, config, apsg_config: _apsg.APSGConfig | None = None, igca_config: _igca.IGCAConfig | None = None):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
@@ -97,6 +98,12 @@ class PI0Pytorch(nn.Module):
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+
+        # IGCA: Instruction-Grounded Contrastive Attention
+        self.igca_config: _igca.IGCAConfig = igca_config or _igca.IGCAConfig()
+        self.igca_step: int = 0
+        if self.igca_config.enabled:
+            self.igca_module = _igca.IGCAModule(self.igca_config, feature_dim=paligemma_config.width)
 
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
@@ -406,7 +413,36 @@ class PI0Pytorch(nn.Module):
 
         action_loss = F.mse_loss(u_t, v_t, reduction="none")
 
-        if not apsg_active:
+        # IGCA: compute contrastive attention loss on visual tokens
+        igca_mask = getattr(observation, "igca_mask", None)
+        igca_active = bool(
+            self.igca_config.enabled and self.training and igca_mask is not None
+        )
+        if igca_active:
+            # Extract visual tokens from prefix embeddings (first image's tokens)
+            num_vis = self._infer_num_vis_tokens(images)
+            vis_tokens = prefix_embs[:, :num_vis, :].to(torch.float32)
+
+            # igca_mask: [B, 16, 16] -> pass to module
+            igca_mask_tensor = igca_mask.to(dtype=torch.float32, device=vis_tokens.device)
+            igca_results = self.igca_module(vis_tokens, igca_mask_tensor)
+
+            lam = _igca.igca_lambda(self.igca_config, getattr(self, "igca_step", None))
+            igca_total = (
+                self.igca_config.lambda_contrast * igca_results["igca_contrast_loss"]
+                + self.igca_config.lambda_att * igca_results["igca_att_loss"]
+            )
+
+            if not apsg_active:
+                return {
+                    "action_loss": action_loss,
+                    "igca_contrast_loss": igca_results["igca_contrast_loss"],
+                    "igca_att_loss": igca_results["igca_att_loss"],
+                    "igca_lambda": lam,
+                    "igca_total": igca_total,
+                }
+
+        if not apsg_active and not igca_active:
             return action_loss
 
         # Compute APSG loss from captured attention. The captured tensor covers

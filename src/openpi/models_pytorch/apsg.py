@@ -430,10 +430,8 @@ class APSGProjection(_transforms.DataTransformFn):
         if self.cfg.target_mode == "future_state_direct":
             # state must be a chunk [H, S]; we consume it back to [S].
             if state.ndim != 2:
-                raise ValueError(
-                    "APSG future_state_direct mode requires state chunking; "
-                    "add 'state' to action_sequence_keys in your DataConfig."
-                )
+                # Inference time: state is unchunked [S], skip APSG projection.
+                return data
             cur_xyz = state[0, self.cfg.state_xyz_slice[0]:self.cfg.state_xyz_slice[1]].astype(np.float32)
             target_xyz = state[-1, self.cfg.state_xyz_slice[0]:self.cfg.state_xyz_slice[1]].astype(np.float32)
             # Restore unchunked state for downstream.

@@ -17,6 +17,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 from openpi.models.vgaa import VGAAConfig
 from openpi.models_pytorch.apsg import APSGConfig, APSGProjection, libero_agentview_projector
+from openpi.models_pytorch.igca import IGCAConfig, IGCAMaskTransform
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -420,6 +421,53 @@ class LeRobotLiberoAPSGDataConfig(LeRobotLiberoDataConfig):
             base,
             data_transforms=new_data_transforms,
             action_sequence_keys=new_action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoIGCADataConfig(LeRobotLiberoDataConfig):
+    """LIBERO data config + IGCA mask loading transform."""
+
+    igca: IGCAConfig = dataclasses.field(default_factory=IGCAConfig)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base = super().create(assets_dirs, model_config)
+        if not self.igca.enabled:
+            return base
+
+        # Add episode_index and frame_index to repack so they survive to data transforms
+        old_repack_inputs = list(base.repack_transforms.inputs)
+        new_repack_inputs = []
+        for tr in old_repack_inputs:
+            if isinstance(tr, _transforms.RepackTransform):
+                # Extend the repack structure with index fields
+                new_structure = dict(tr.structure)
+                new_structure["episode_index"] = "episode_index"
+                new_structure["frame_index"] = "frame_index"
+                new_repack_inputs.append(_transforms.RepackTransform(new_structure))
+            else:
+                new_repack_inputs.append(tr)
+        new_repack = _transforms.Group(inputs=new_repack_inputs, outputs=base.repack_transforms.outputs)
+
+        # Insert mask transform after LiberoInputs in data_transforms
+        mask_transform = IGCAMaskTransform(mask_dir=self.igca.mask_dir)
+        new_inputs = list(base.data_transforms.inputs)
+        insert_at = 1
+        for i, tr in enumerate(new_inputs):
+            if isinstance(tr, libero_policy.LiberoInputs):
+                insert_at = i + 1
+                break
+        new_inputs.insert(insert_at, mask_transform)
+        new_data_transforms = _transforms.Group(
+            inputs=new_inputs,
+            outputs=base.data_transforms.outputs,
+        )
+
+        return dataclasses.replace(
+            base,
+            repack_transforms=new_repack,
+            data_transforms=new_data_transforms,
         )
 
 
@@ -837,9 +885,16 @@ _CONFIGS = [
         # Here you define which pre-trained checkpoint you want to load to initialize the model.
         # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
-        # Check the base TrainConfig class for a full list of available hyperparameters.
+        pytorch_weight_path="/DATA/disk0/yjb/.cache/openpi/openpi-assets/pytorch_checkpoints/pi0_base",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         num_train_steps=30_000,
+        save_interval=5_000,
     ),
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
@@ -1002,7 +1057,44 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path="/DATA/disk0/yjb/.cache/openpi/openpi-assets/pytorch_checkpoints/pi0_base",
         num_train_steps=30_000,
+    ),
+    #
+    # IGCA (Instruction-Grounded Contrastive Attention) config.
+    #
+    TrainConfig(
+        name="pi0_libero_igca",
+        model=pi0_config.Pi0Config(
+            igca=IGCAConfig(
+                enabled=True,
+                lambda_contrast=0.01,
+                lambda_att=0.1,
+                margin=10.0,
+                warmup_steps=1000,
+                mask_dir="./data/igca_masks",
+            ),
+        ),
+        data=LeRobotLiberoIGCADataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            igca=IGCAConfig(
+                enabled=True,
+                mask_dir="./data/igca_masks",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path="/DATA/disk0/yjb/.cache/openpi/openpi-assets/pytorch_checkpoints/pi0_base",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30_000,
+        save_interval=5_000,
     ),
     TrainConfig(
         name="pi0_libero_vgaa_cheap",

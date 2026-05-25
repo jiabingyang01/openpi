@@ -113,6 +113,10 @@ class Observation(Generic[ArrayT]):
     apsg_target_in_bounds: at.Bool[ArrayT, "*b"] | None = None
     apsg_sigma_patches: at.Float[ArrayT, "*b"] | None = None
 
+    # IGCA (Instruction-Grounded Contrastive Attention) optional field,
+    # populated by IGCAMaskTransform. Shape [patch_h, patch_w], binary.
+    igca_mask: at.Float[ArrayT, "*b ph pw"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -136,6 +140,7 @@ class Observation(Generic[ArrayT]):
             apsg_target_uv=data.get("apsg_target_uv"),
             apsg_target_in_bounds=data.get("apsg_target_in_bounds"),
             apsg_sigma_patches=data.get("apsg_sigma_patches"),
+            igca_mask=data.get("igca_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

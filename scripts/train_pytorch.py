@@ -407,7 +407,8 @@ def train_loop(config: _config.TrainConfig):
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     apsg_cfg = getattr(model_cfg, "apsg", None)
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg, apsg_config=apsg_cfg).to(device)
+    igca_cfg = getattr(model_cfg, "igca", None)
+    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg, apsg_config=apsg_cfg, igca_config=igca_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -445,7 +446,8 @@ def train_loop(config: _config.TrainConfig):
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
         safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path,
+            strict=False,
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
@@ -527,22 +529,36 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass. Provide current step to the underlying model so the
-            # optional APSG lambda warmup can scale itself.
+            # optional APSG/IGCA lambda warmup can scale itself.
             inner_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
             inner_model.apsg_step = global_step
+            inner_model.igca_step = global_step
 
             losses = model(observation, actions)
             # APSG returns a dict with the action loss tensor plus auxiliaries.
             apsg_loss_val = None
             apsg_lambda_val = 0.0
             apsg_in_bounds = None
+            igca_contrast_val = None
+            igca_att_val = None
+            igca_lambda_val = 0.0
             if isinstance(losses, dict):
                 action_losses = losses["action_loss"]
-                apsg_loss_val = losses["apsg_loss"]
-                apsg_lambda_val = float(losses["apsg_lambda"])
-                apsg_in_bounds = float(losses["apsg_in_bounds"].item())
                 action_loss = action_losses.mean()
-                loss = action_loss + apsg_lambda_val * apsg_loss_val
+
+                if "apsg_loss" in losses:
+                    apsg_loss_val = losses["apsg_loss"]
+                    apsg_lambda_val = float(losses["apsg_lambda"])
+                    apsg_in_bounds = float(losses["apsg_in_bounds"].item())
+                    loss = action_loss + apsg_lambda_val * apsg_loss_val
+                elif "igca_contrast_loss" in losses:
+                    igca_contrast_val = losses["igca_contrast_loss"]
+                    igca_att_val = losses["igca_att_loss"]
+                    igca_lambda_val = float(losses["igca_lambda"])
+                    igca_total = losses["igca_total"]
+                    loss = action_loss + igca_lambda_val * igca_total
+                else:
+                    loss = action_loss
             else:
                 # Baseline path: per-element tensor.
                 if isinstance(losses, list | tuple):
@@ -584,6 +600,11 @@ def train_loop(config: _config.TrainConfig):
                     info["apsg_loss"] = float(apsg_loss_val.item())
                     info["apsg_lambda"] = apsg_lambda_val
                     info["apsg_in_bounds"] = apsg_in_bounds
+                if igca_contrast_val is not None:
+                    info["action_loss"] = float(action_loss.item())
+                    info["igca_contrast_loss"] = float(igca_contrast_val.item())
+                    info["igca_att_loss"] = float(igca_att_val.item())
+                    info["igca_lambda"] = igca_lambda_val
                 infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0):
