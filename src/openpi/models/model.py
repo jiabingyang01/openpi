@@ -257,8 +257,10 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        apsg_cfg = getattr(train_config.model, "apsg", None)
+        igca_cfg = getattr(train_config.model, "igca", None)
+        model = pi0_pytorch.PI0Pytorch(config=train_config.model, apsg_config=apsg_cfg, igca_config=igca_cfg)
+        safetensors.torch.load_model(model, weight_path, strict=False)
         return model
 
     @abc.abstractmethod
