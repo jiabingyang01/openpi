@@ -408,7 +408,8 @@ def train_loop(config: _config.TrainConfig):
 
     apsg_cfg = getattr(model_cfg, "apsg", None)
     igca_cfg = getattr(model_cfg, "igca", None)
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg, apsg_config=apsg_cfg, igca_config=igca_cfg).to(device)
+    dual_flow_cfg = getattr(model_cfg, "dual_flow", None)
+    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg, apsg_config=apsg_cfg, igca_config=igca_cfg, dual_flow_config=dual_flow_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -533,6 +534,7 @@ def train_loop(config: _config.TrainConfig):
             inner_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
             inner_model.apsg_step = global_step
             inner_model.igca_step = global_step
+            inner_model.dual_flow_step = global_step
 
             losses = model(observation, actions)
             # APSG returns a dict with the action loss tensor plus auxiliaries.
@@ -542,11 +544,17 @@ def train_loop(config: _config.TrainConfig):
             igca_contrast_val = None
             igca_att_val = None
             igca_lambda_val = 0.0
+            df_mask_loss_val = None
+            df_lambda_val = 0.0
             if isinstance(losses, dict):
                 action_losses = losses["action_loss"]
                 action_loss = action_losses.mean()
 
-                if "apsg_loss" in losses:
+                if "dual_flow_mask_loss" in losses:
+                    df_mask_loss_val = losses["dual_flow_mask_loss"]
+                    df_lambda_val = float(losses["dual_flow_lambda"])
+                    loss = action_loss + df_lambda_val * df_mask_loss_val
+                elif "apsg_loss" in losses:
                     apsg_loss_val = losses["apsg_loss"]
                     apsg_lambda_val = float(losses["apsg_lambda"])
                     apsg_in_bounds = float(losses["apsg_in_bounds"].item())
@@ -605,6 +613,10 @@ def train_loop(config: _config.TrainConfig):
                     info["igca_contrast_loss"] = float(igca_contrast_val.item())
                     info["igca_att_loss"] = float(igca_att_val.item())
                     info["igca_lambda"] = igca_lambda_val
+                if df_mask_loss_val is not None:
+                    info["action_loss"] = float(action_loss.item())
+                    info["dual_flow_mask_loss"] = float(df_mask_loss_val.item())
+                    info["dual_flow_lambda"] = df_lambda_val
                 infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0):

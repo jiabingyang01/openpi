@@ -117,6 +117,10 @@ class Observation(Generic[ArrayT]):
     # populated by IGCAMaskTransform. Shape [patch_h, patch_w], binary.
     igca_mask: at.Float[ArrayT, "*b ph pw"] | None = None
 
+    # Dual Flow Matching: mask trajectory covering the action horizon.
+    # Shape [action_horizon, patch_h, patch_w], populated by DualFlowMaskSeqTransform.
+    dual_flow_mask_seq: at.Float[ArrayT, "*b h ph pw"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -141,6 +145,7 @@ class Observation(Generic[ArrayT]):
             apsg_target_in_bounds=data.get("apsg_target_in_bounds"),
             apsg_sigma_patches=data.get("apsg_sigma_patches"),
             igca_mask=data.get("igca_mask"),
+            dual_flow_mask_seq=data.get("dual_flow_mask_seq"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -259,7 +264,8 @@ class BaseModelConfig(abc.ABC):
         logger.info(f"train_config: {train_config}")
         apsg_cfg = getattr(train_config.model, "apsg", None)
         igca_cfg = getattr(train_config.model, "igca", None)
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model, apsg_config=apsg_cfg, igca_config=igca_cfg)
+        dual_flow_cfg = getattr(train_config.model, "dual_flow", None)
+        model = pi0_pytorch.PI0Pytorch(config=train_config.model, apsg_config=apsg_cfg, igca_config=igca_cfg, dual_flow_config=dual_flow_cfg)
         safetensors.torch.load_model(model, weight_path, strict=False)
         return model
 

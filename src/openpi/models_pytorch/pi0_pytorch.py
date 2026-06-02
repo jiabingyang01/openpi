@@ -8,6 +8,7 @@ import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch import apsg as _apsg
+from openpi.models_pytorch import dual_flow as _dual_flow
 from openpi.models_pytorch import igca as _igca
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
@@ -84,7 +85,8 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class PI0Pytorch(nn.Module):
-    def __init__(self, config, apsg_config: _apsg.APSGConfig | None = None, igca_config: _igca.IGCAConfig | None = None):
+    def __init__(self, config, apsg_config: _apsg.APSGConfig | None = None, igca_config: _igca.IGCAConfig | None = None,
+                 dual_flow_config: _dual_flow.DualFlowConfig | None = None):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
@@ -104,6 +106,17 @@ class PI0Pytorch(nn.Module):
         self.igca_step: int = 0
         if self.igca_config.enabled:
             self.igca_module = _igca.IGCAModule(self.igca_config, feature_dim=paligemma_config.width)
+
+        # Dual Flow Matching
+        self.dual_flow_config: _dual_flow.DualFlowConfig = dual_flow_config or _dual_flow.DualFlowConfig()
+        self.dual_flow_step: int = 0
+        if self.dual_flow_config.enabled:
+            mask_input_dim = self.dual_flow_config.patch_grid ** 2
+            self.mask_in_proj = nn.Linear(mask_input_dim, action_expert_config.width)
+            self.mask_out_proj = nn.Linear(action_expert_config.width, mask_input_dim)
+            if not self.pi05:
+                self.mask_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
+                self.mask_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
@@ -249,8 +262,12 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(self, state, noisy_actions, timestep, noisy_masks=None):
+        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
+
+        When ``noisy_masks`` is provided (Dual Flow Matching), mask tokens are
+        appended after the action tokens in the suffix.
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -288,8 +305,8 @@ class PI0Pytorch(nn.Module):
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         if not self.pi05:
-            time_emb = time_emb[:, None, :].expand_as(action_emb)
-            action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+            time_emb_expanded = time_emb[:, None, :].expand_as(action_emb)
+            action_time_emb = torch.cat([action_emb, time_emb_expanded], dim=2)
 
             # Apply MLP layers
             def mlp_func(action_time_emb):
@@ -321,6 +338,31 @@ class PI0Pytorch(nn.Module):
         # Set attention masks so that image, language and state inputs do not attend to action tokens
         att_masks += [1] + ([0] * (self.config.action_horizon - 1))
 
+        # --- Dual Flow: append mask tokens after action tokens ---
+        if noisy_masks is not None and self.dual_flow_config.enabled:
+            def mask_proj_func(noisy_masks):
+                return self.mask_in_proj(noisy_masks)
+
+            mask_emb = self._apply_checkpoint(mask_proj_func, noisy_masks)  # [B, H, width]
+
+            if not self.pi05:
+                time_emb_m = time_emb[:, None, :].expand_as(mask_emb)
+                mask_time_emb = torch.cat([mask_emb, time_emb_m], dim=2)
+
+                def mask_mlp_func(mask_time_emb):
+                    x = self.mask_time_mlp_in(mask_time_emb)
+                    x = F.silu(x)
+                    return self.mask_time_mlp_out(x)
+
+                mask_time_emb = self._apply_checkpoint(mask_mlp_func, mask_time_emb)
+            else:
+                mask_time_emb = mask_emb
+
+            embs.append(mask_time_emb)
+            mask_pad = torch.ones(bsize, mask_time_emb.shape[1], dtype=torch.bool, device=timestep.device)
+            pad_masks.append(mask_pad)
+            att_masks += [0] * self.config.action_horizon
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
@@ -347,8 +389,27 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        # --- Dual Flow: prepare mask flow in parallel ---
+        dual_flow_mask_seq = getattr(observation, "dual_flow_mask_seq", None)
+        dual_flow_active = bool(
+            self.dual_flow_config.enabled and self.training and dual_flow_mask_seq is not None
+        )
+        noisy_masks_for_suffix = None
+        u_t_mask = None
+        if dual_flow_active:
+            B, H = actions.shape[0], self.config.action_horizon
+            pg = self.dual_flow_config.patch_grid
+            mask_seq = dual_flow_mask_seq.to(dtype=torch.float32, device=actions.device)
+            mask_flat = mask_seq.reshape(B, H, pg * pg)  # [B, H, 256]
+            noise_m = self.sample_noise(mask_flat.shape, actions.device)
+            m_t = time_expanded * noise_m + (1 - time_expanded) * mask_flat
+            u_t_mask = noise_m - mask_flat
+            noisy_masks_for_suffix = m_t
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, time, noisy_masks=noisy_masks_for_suffix,
+        )
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -402,16 +463,49 @@ class PI0Pytorch(nn.Module):
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        # --- Extract action (and optionally mask) outputs from suffix ---
+        H = self.config.action_horizon
+        if dual_flow_active:
+            # suffix layout: [state(1), action(H), mask(H)]
+            # state is not part of suffix_out when we index from the model output;
+            # the model returns all suffix tokens including state.
+            n_suffix = 1 + H + H if not self.pi05 else H + H
+            suffix_out = suffix_out[:, -n_suffix:]
+            suffix_out = suffix_out.to(dtype=torch.float32)
+            if not self.pi05:
+                action_out = suffix_out[:, 1:1 + H, :]
+                mask_out = suffix_out[:, 1 + H:, :]
+            else:
+                action_out = suffix_out[:, :H, :]
+                mask_out = suffix_out[:, H:, :]
+        else:
+            suffix_out = suffix_out[:, -H:]
+            suffix_out = suffix_out.to(dtype=torch.float32)
+            action_out = suffix_out
 
         # Apply gradient checkpointing to final action projection if enabled
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
+        def action_out_proj_func(action_out):
+            return self.action_out_proj(action_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        v_t = self._apply_checkpoint(action_out_proj_func, action_out)
 
         action_loss = F.mse_loss(u_t, v_t, reduction="none")
+
+        # --- Dual Flow: mask flow loss ---
+        if dual_flow_active:
+            def mask_out_proj_func(mask_out):
+                return self.mask_out_proj(mask_out)
+
+            v_t_mask = self._apply_checkpoint(mask_out_proj_func, mask_out)
+            mask_loss = F.mse_loss(u_t_mask, v_t_mask, reduction="none").mean()
+            df_lambda = _dual_flow.dual_flow_lambda(
+                self.dual_flow_config, getattr(self, "dual_flow_step", None),
+            )
+            return {
+                "action_loss": action_loss,
+                "dual_flow_mask_loss": mask_loss,
+                "dual_flow_lambda": df_lambda,
+            }
 
         # IGCA: compute contrastive attention loss on visual tokens
         igca_mask = getattr(observation, "igca_mask", None)
@@ -564,20 +658,32 @@ class PI0Pytorch(nn.Module):
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
+        # Dual Flow: initialise mask noise alongside action noise
+        dual_flow_infer = self.dual_flow_config.enabled
+        pg = self.dual_flow_config.patch_grid
+        mask_noise = None
+        if dual_flow_infer:
+            mask_noise = self.sample_noise(
+                (bsize, self.config.action_horizon, pg * pg), device,
+            )
+
         x_t = noise
+        m_t = mask_noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
+            v_t_action, v_t_mask = self.denoise_step(
                 state,
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
                 expanded_time,
+                noisy_masks=m_t,
             )
 
-            # Euler step - use new tensor assignment instead of in-place operation
-            x_t = x_t + dt * v_t
+            x_t = x_t + dt * v_t_action
+            if m_t is not None:
+                m_t = m_t + dt * v_t_mask
             time += dt
         return x_t
 
@@ -588,9 +694,16 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        noisy_masks=None,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+
+        Returns ``(v_t_action, v_t_mask)``; ``v_t_mask`` is ``None`` when Dual
+        Flow is inactive.
+        """
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, timestep, noisy_masks=noisy_masks,
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -619,6 +732,20 @@ class PI0Pytorch(nn.Module):
         )
 
         suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        H = self.config.action_horizon
+
+        if noisy_masks is not None and self.dual_flow_config.enabled:
+            n_suffix = 1 + H + H if not self.pi05 else H + H
+            suffix_out = suffix_out[:, -n_suffix:]
+            suffix_out = suffix_out.to(dtype=torch.float32)
+            if not self.pi05:
+                action_out = suffix_out[:, 1:1 + H, :]
+                mask_out = suffix_out[:, 1 + H:, :]
+            else:
+                action_out = suffix_out[:, :H, :]
+                mask_out = suffix_out[:, H:, :]
+            return self.action_out_proj(action_out), self.mask_out_proj(mask_out)
+
+        suffix_out = suffix_out[:, -H:]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        return self.action_out_proj(suffix_out), None

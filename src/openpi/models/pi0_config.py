@@ -10,6 +10,7 @@ from openpi.models import model as _model
 import openpi.models.gemma as _gemma
 from openpi.models.vgaa import VGAAConfig
 from openpi.models_pytorch.apsg import APSGConfig
+from openpi.models_pytorch.dual_flow import DualFlowConfig
 from openpi.models_pytorch.igca import IGCAConfig
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -41,6 +42,8 @@ class Pi0Config(_model.BaseModelConfig):
     apsg: APSGConfig = dataclasses.field(default_factory=APSGConfig)
     # IGCA configuration. When igca.enabled=False (default), no overhead.
     igca: IGCAConfig = dataclasses.field(default_factory=IGCAConfig)
+    # Dual Flow Matching configuration. When dual_flow.enabled=False (default), no overhead.
+    dual_flow: DualFlowConfig = dataclasses.field(default_factory=DualFlowConfig)
 
     def __post_init__(self):
         if self.max_token_len is None:

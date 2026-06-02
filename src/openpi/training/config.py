@@ -17,6 +17,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 from openpi.models.vgaa import VGAAConfig
 from openpi.models_pytorch.apsg import APSGConfig, APSGProjection, libero_agentview_projector
+from openpi.models_pytorch.dual_flow import DualFlowConfig, DualFlowMaskSeqTransform
 from openpi.models_pytorch.igca import IGCAConfig, IGCAMaskTransform
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
@@ -25,6 +26,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.maniparena_policy as maniparena_policy
 import openpi.policies.dynaactvae_transforms as dynaactvae_transforms
+import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -472,6 +474,56 @@ class LeRobotLiberoIGCADataConfig(LeRobotLiberoDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotLiberoDualFlowDataConfig(LeRobotLiberoDataConfig):
+    """LIBERO data config + Dual Flow mask sequence loading transform."""
+
+    dual_flow: DualFlowConfig = dataclasses.field(default_factory=DualFlowConfig)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base = super().create(assets_dirs, model_config)
+        if not self.dual_flow.enabled:
+            return base
+
+        # Preserve episode_index and frame_index through repack
+        old_repack_inputs = list(base.repack_transforms.inputs)
+        new_repack_inputs = []
+        for tr in old_repack_inputs:
+            if isinstance(tr, _transforms.RepackTransform):
+                new_structure = dict(tr.structure)
+                new_structure["episode_index"] = "episode_index"
+                new_structure["frame_index"] = "frame_index"
+                new_repack_inputs.append(_transforms.RepackTransform(new_structure))
+            else:
+                new_repack_inputs.append(tr)
+        new_repack = _transforms.Group(inputs=new_repack_inputs, outputs=base.repack_transforms.outputs)
+
+        action_horizon = getattr(model_config, "action_horizon", 50)
+        mask_transform = DualFlowMaskSeqTransform(
+            mask_dir=self.dual_flow.mask_dir,
+            patch_grid=self.dual_flow.patch_grid,
+            action_horizon=action_horizon,
+        )
+        new_inputs = list(base.data_transforms.inputs)
+        insert_at = 1
+        for i, tr in enumerate(new_inputs):
+            if isinstance(tr, libero_policy.LiberoInputs):
+                insert_at = i + 1
+                break
+        new_inputs.insert(insert_at, mask_transform)
+        new_data_transforms = _transforms.Group(
+            inputs=new_inputs,
+            outputs=base.data_transforms.outputs,
+        )
+
+        return dataclasses.replace(
+            base,
+            repack_transforms=new_repack,
+            data_transforms=new_data_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotManipArenaDataConfig(DataConfigFactory):
     """Config for ManipArena bimanual dataset (LeRobot format).
 
@@ -567,6 +619,74 @@ class LeRobotManipArenaDynaActVAEDataConfig(LeRobotManipArenaDataConfig):
         )
 
         return dataclasses.replace(base, data_transforms=data_transforms)
+
+
+@dataclasses.dataclass(frozen=True)
+class DualYamDataConfig(DataConfigFactory):
+    """Data config for the dual-arm YAM system (RSS2026 Post-Training Challenge).
+
+    Ported verbatim from the official posttraining-for-robotics/openpi-baseline.
+    State/action are 14-dim JOINT space: [left 6 joints, left gripper, right 6 joints, right gripper];
+    grippers normalized to [0, 1]. Cameras: cam_high / cam_left_wrist / cam_right_wrist.
+    """
+
+    # If true, joint dims become deltas w.r.t. current state; grippers stay absolute.
+    use_delta_joint_actions: bool = True
+    # Injected if the "prompt" key is missing.
+    default_prompt: str | None = ""
+    # Convert YAM/Piper joint+gripper space to the pi internal space used to pretrain the base model.
+    adapt_to_pi: bool = True
+
+    # Map raw LeRobot keys -> internal keys.
+    repack_transforms: _transforms.Group = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                yam_policy.YamInputs(
+                    action_dim=model_config.action_dim,
+                    adapt_to_pi=self.adapt_to_pi,
+                    model_type=model_config.model_type,
+                )
+            ],
+            outputs=[yam_policy.YamOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            # Left and right arm joints use delta actions; grippers (dims 6 and 13) stay absolute.
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1096,6 +1216,40 @@ _CONFIGS = [
         num_train_steps=30_000,
         save_interval=5_000,
     ),
+    #
+    # Dual Flow Matching config.
+    #
+    TrainConfig(
+        name="pi0_libero_dual_flow",
+        model=pi0_config.Pi0Config(
+            dual_flow=DualFlowConfig(
+                enabled=True,
+                lambda_mask=0.1,
+                warmup_steps=1000,
+                mask_dir="./data/igca_masks",
+            ),
+        ),
+        data=LeRobotLiberoDualFlowDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            dual_flow=DualFlowConfig(
+                enabled=True,
+                mask_dir="./data/igca_masks",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path="/DATA/disk0/yjb/.cache/openpi/openpi-assets/pytorch_checkpoints/pi0_base",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30_000,
+        save_interval=5_000,
+    ),
     TrainConfig(
         name="pi0_libero_vgaa_cheap",
         model=pi0_config.Pi0Config(
@@ -1321,6 +1475,99 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+    ),
+    #
+    # RSS2026 Post-Training Challenge (dual-YAM, 14-dim joint space).
+    # model uses Pi0Config(pi05=True) DEFAULTS (action_horizon=50, discrete_state_input=True,
+    # action_dim=32, max_token_len=200) to match the official baseline verbatim.
+    # NOTE: edit local_root to where you downloaded the dataset before running.
+    #
+    TrainConfig(
+        name="pi05_insert-mouse-battery",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=DualYamDataConfig(
+            repo_id="insert-mouse-battery/expert-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/DATA/disk0/yjb/datasets/rss2026/Challenge-phase1-dataset/insert-mouse-battery/expert-data",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=20_000,
+        keep_period=20_000,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi05_seal-water-bottle-cap",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=DualYamDataConfig(
+            repo_id="seal-water-bottle-cap/expert-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/DATA/disk0/yjb/datasets/rss2026/Challenge-phase1-dataset/seal-water-bottle-cap/expert-data",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=20_000,
+        keep_period=20_000,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi05_tower-of-hanoi-game",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=DualYamDataConfig(
+            repo_id="tower-of-hanoi-game/expert-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/DATA/disk0/yjb/datasets/rss2026/Challenge-phase1-dataset/tower-of-hanoi-game/expert-data",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=20_000,
+        keep_period=20_000,
+        fsdp_devices=1,
+    ),
+    # Multi-Task track: one generalist over all 3 tasks (local_root list -> ConcatDataset;
+    # prompt_from_task distinguishes tasks). asset_id explicit because there are multiple sources.
+    TrainConfig(
+        name="pi05_multitask",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=DualYamDataConfig(
+            repo_id="challenge/multitask",
+            assets=AssetsConfig(asset_id="rss2026/multitask"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root=[
+                    "/DATA/disk0/yjb/datasets/rss2026/Challenge-phase1-dataset/insert-mouse-battery/expert-data",
+                    "/DATA/disk0/yjb/datasets/rss2026/Challenge-phase1-dataset/seal-water-bottle-cap/expert-data",
+                    "/DATA/disk0/yjb/datasets/rss2026/Challenge-phase1-dataset/tower-of-hanoi-game/expert-data",
+                ],
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=300_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=30_000,
+        keep_period=30_000,
+        fsdp_devices=1,
     ),
     #
     # Fine-tuning Aloha configs.
