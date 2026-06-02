@@ -65,7 +65,7 @@ BASE_PORT="${BASE_PORT:-8000}"
 # Eval params
 NUM_TRIALS="${NUM_TRIALS:-50}"
 REPLAN_STEPS="${REPLAN_STEPS:-5}"
-SEED="${SEED:-9}"
+SEED="${SEED:-8}"
 
 # RUN_ID: identifies this run. Defaults to ${MODEL}-${TASK_SUITE}-<timestamp>, giving
 # distinct log dirs for pi0 vs pi05 and across suites. Override for custom labels:
